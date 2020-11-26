@@ -3,11 +3,12 @@ use crate::util::eth_proof_helper::{DoubleNodeWithMerkleProofJson, Witness};
 use crate::util::eth_util::{convert_to_header_rlp, decode_block_header};
 use crate::util::settings::{OutpointConf, Settings};
 use anyhow::{anyhow, bail, Result};
+use ckb_jsonrpc_types::{JsonBytes, Uint32};
 use ckb_sdk::constants::MIN_SECP_CELL_CAPACITY;
 use ckb_sdk::{Address, AddressPayload, GenesisInfo, HttpRpcClient, SECP256K1};
 use ckb_types::core::{BlockView, Capacity, DepType, TransactionView};
-use ckb_types::packed::{HeaderVec, ScriptReader, WitnessArgs};
-use ckb_types::prelude::{Builder, Entity, Pack, Reader};
+use ckb_types::packed::{CellInput, HeaderVec, ScriptReader, WitnessArgs};
+use ckb_types::prelude::{Builder, Entity, Pack, Reader, Unpack};
 use ckb_types::{
     bytes::Bytes,
     packed::{self, Byte32, CellDep, CellOutput, OutPoint, Script},
@@ -27,7 +28,8 @@ use force_eth_types::generated::{basic, witness};
 use force_sdk::cell_collector::{collect_sudt_amount, get_live_cell_by_typescript};
 use force_sdk::indexer::{Cell, IndexerRpcClient};
 use force_sdk::tx_helper::{sign, TxHelper};
-use force_sdk::util::{get_live_cell_with_cache, send_tx_sync};
+use force_sdk::util::{get_live_cell, get_live_cell_with_cache, send_tx_sync};
+use jsonrpc_core_client::transports::ClientResponse::Output;
 use log::info;
 use rlp::Rlp;
 use secp256k1::SecretKey;
@@ -46,6 +48,7 @@ pub struct Generator {
     pub indexer_client: IndexerRpcClient,
     genesis_info: GenesisInfo,
     pub settings: Settings,
+    pub live_cell_cache: HashMap<(OutPoint, bool), (CellOutput, Bytes)>,
 }
 
 impl Generator {
@@ -58,11 +61,14 @@ impl Generator {
             .ok_or_else(|| anyhow!("Can not get genesis block?"))?
             .into();
         let genesis_info = GenesisInfo::from_block(&genesis_block).map_err(|err| anyhow!(err))?;
+        let mut live_cell_cache: HashMap<(OutPoint, bool), (CellOutput, Bytes)> =
+            Default::default();
         Ok(Self {
             rpc_client,
             indexer_client,
             genesis_info,
             settings,
+            live_cell_cache,
         })
     }
 
@@ -157,11 +163,12 @@ impl Generator {
     pub fn generate_eth_light_client_tx(
         &mut self,
         header: &Block<ethereum_types::H256>,
-        cell: &Cell,
+        cell: Cell,
+        rest_cell: Cell,
         witness: &Witness,
         headers: &[BlockHeader],
         from_lockscript: Script,
-    ) -> Result<TransactionView> {
+    ) -> Result<(TransactionView, Cell, Cell)> {
         let tx_fee: u64 = 500_000;
         let mut helper = TxHelper::default();
 
@@ -173,28 +180,48 @@ impl Generator {
         self.add_cell_deps(&mut helper, outpoints)
             .map_err(|err| anyhow!(err))?;
 
-        let mut live_cell_cache: HashMap<(OutPoint, bool), (CellOutput, Bytes)> =
-            Default::default();
-        let rpc_client = &mut self.rpc_client;
-        let mut get_live_cell_fn = |out_point: OutPoint, with_data: bool| {
-            get_live_cell_with_cache(&mut live_cell_cache, rpc_client, out_point, with_data)
-                .map(|(output, _)| output)
-        };
-        helper
-            .add_input(
-                OutPoint::from(cell.clone().out_point),
-                None,
-                &mut get_live_cell_fn,
-                &self.genesis_info,
-                true,
-            )
-            .map_err(|err| anyhow!(err))?;
+        // let mut live_cell_cache: HashMap<(OutPoint, bool), (CellOutput, Bytes)> =
+        //     Default::default();
+        // let rpc_client = &mut self.rpc_client;
+        // let mut get_live_cell_fn = |out_point: OutPoint, with_data: bool| {
+        //     get_live_cell_with_cache(&mut live_cell_cache, rpc_client, out_point, with_data)
+        //         .map(|(output, _)| output)
+        // };
+        let input = CellInput::new_builder()
+            .previous_output(OutPoint::from(cell.clone().out_point))
+            .build();
+        // let outpoint_cell: CellOutput = get_live_cell(out_point, skip_check)?;
+        let cell_dep = Some(self.genesis_info.sighash_dep());
+
+        let mut tx_builder = helper.transaction.as_advanced_builder().input(input);
+        if cell_dep.is_some() {
+            let cell_dep = cell_dep.expect("invalid cell dep");
+            if helper
+                .transaction
+                .cell_deps()
+                .into_iter()
+                .all(|d| d != cell_dep)
+            {
+                tx_builder = tx_builder.cell_dep(cell_dep);
+            }
+        }
+        helper.transaction = tx_builder.build();
+
+        // helper
+        //     .add_input(
+        //         OutPoint::from(cell.clone().out_point),
+        //         None,
+        //         &mut get_live_cell_fn,
+        //         &self.genesis_info,
+        //         true,
+        //     )
+        //     .map_err(|err| anyhow!(err))?;
         {
-            let cell_output = CellOutput::from(cell.clone().output);
-            let output = CellOutput::new_builder()
-                .lock(cell_output.lock())
-                .type_(cell_output.type_())
-                .build();
+            let output = CellOutput::from(cell.clone().output);
+            // let output = CellOutput::new_builder()
+            //     .lock(cell_output.lock())
+            //     .type_(cell_output.type_())
+            //     .build();
             let tip = &headers[headers.len() - 1];
             let input_cell_data = packed::Bytes::from(cell.clone().output_data).raw_data();
             let (mut unconfirmed, mut confirmed) = parse_main_raw_data(&input_cell_data)?;
@@ -217,15 +244,6 @@ impl Generator {
                     confirmed.remove(0);
                 }
 
-                // if confirmed.len().add(unconfirmed.len()) == MAIN_HEADER_CACHE_LIMIT {
-                //     confirmed.remove(0);
-                //     let temp_data = unconfirmed[0];
-                //     ETHHeaderInfoReader::verify(&temp_data, false).map_err(|err| anyhow!(err))?;
-                //     let header_info_reader = ETHHeaderInfoReader::new_unchecked(&temp_data);
-                //     let hash = header_info_reader.hash().raw_data();
-                //     confirmed.push(hash);
-                //     unconfirmed.remove(0);
-                // }
                 let input_tail_raw = unconfirmed[unconfirmed.len() - 1];
                 ETHHeaderInfoReader::verify(&input_tail_raw, false).map_err(|err| anyhow!(err))?;
                 let input_tail_reader = ETHHeaderInfoReader::new_unchecked(&input_tail_raw);
@@ -315,17 +333,69 @@ impl Generator {
                 .build();
         }
         // build tx
-        let tx = helper
-            .supply_capacity(
-                &mut self.rpc_client,
-                &mut self.indexer_client,
-                from_lockscript,
-                &self.genesis_info,
-                tx_fee,
-            )
-            .map_err(|err| anyhow!(err))?;
+        let input_rest = CellInput::new_builder()
+            .previous_output(rest_cell.clone().out_point.into())
+            .since((0 as u64).pack())
+            .build();
+        let tx_builder = helper.transaction.as_advanced_builder().input(input_rest);
+        helper.transaction = tx_builder.build();
+        let output_cap: u64 = helper.transaction.output(0).unwrap().capacity().unpack();
+        let input_cap = cell.clone().output.capacity.value();
+        let rest_capacity = rest_cell.output.capacity.value() + input_cap - tx_fee - output_cap;
+        dbg!(rest_capacity);
+        let change_output = CellOutput::new_builder()
+            .capacity(Capacity::shannons(rest_capacity).pack())
+            .lock(from_lockscript.clone())
+            .build();
+        helper.add_output(change_output, Bytes::default());
+        let tx = helper.transaction;
+        // let tx = helper
+        //     .supply_capacity(
+        //         &mut self.rpc_client,
+        //         &mut self.indexer_client,
+        //         from_lockscript,
+        //         &self.genesis_info,
+        //         tx_fee,
+        //     )
+        //     .map_err(|err| anyhow!(err))?;
 
-        Ok(tx)
+        let new_cell = Cell {
+            output: ckb_jsonrpc_types::CellOutput::from(tx.output(0).unwrap()),
+            output_data: JsonBytes::from(tx.outputs_data().get_unchecked(0)),
+            out_point: ckb_jsonrpc_types::OutPoint {
+                tx_hash: tx.hash().unpack(),
+                index: Uint32::from(0),
+            },
+            block_number: Default::default(),
+            tx_index: ckb_jsonrpc_types::Uint32::from(0),
+        };
+        let new_rest_cell = Cell {
+            output: ckb_jsonrpc_types::CellOutput::from(tx.output(1).unwrap()),
+            output_data: JsonBytes::from(tx.outputs_data().get_unchecked(1)),
+            out_point: ckb_jsonrpc_types::OutPoint {
+                tx_hash: tx.hash().unpack(),
+                index: Uint32::from(1),
+            },
+            block_number: Default::default(),
+            tx_index: ckb_jsonrpc_types::Uint32::from(1),
+        };
+        for i in 0..tx.outputs().len() {
+            self.live_cell_cache.insert(
+                (OutPoint::new(tx.hash(), i as u32), true),
+                (
+                    tx.outputs().get_unchecked(i),
+                    tx.outputs_data().get_unchecked(i).raw_data(),
+                ),
+            );
+            self.live_cell_cache.insert(
+                (OutPoint::new(tx.hash(), i as u32), false),
+                (tx.outputs().get_unchecked(i), Default::default()),
+            );
+        }
+
+        dbg!(hex::encode(cell.clone().out_point.tx_hash.as_bytes()));
+        dbg!(hex::encode(new_cell.clone().out_point.tx_hash.as_bytes()));
+        Ok((tx, new_cell, new_rest_cell))
     }
 
     #[allow(clippy::mutable_key_type)]

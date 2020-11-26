@@ -71,6 +71,21 @@ pub fn sign(
     tx_helper.sign(get_live_cell_fn, privkey)
 }
 
+#[allow(clippy::mutable_key_type)]
+pub fn sign_with_cache(
+    mut live_cell_cache: &mut HashMap<(OutPoint, bool), (CellOutput, Bytes)>,
+    tx: TransactionView,
+    rpc_client: &mut HttpRpcClient,
+    privkey: &SecretKey,
+) -> Result<TransactionView, String> {
+    let get_live_cell_fn = |out_point: OutPoint, with_data: bool| {
+        get_live_cell_with_cache(&mut live_cell_cache, rpc_client, out_point, with_data)
+            .map(|(output, _)| output)
+    };
+    let mut tx_helper = TxHelper::new(tx);
+    tx_helper.sign(get_live_cell_fn, privkey)
+}
+
 /// A transaction helper handle input/output with secp256k1(sighash/multisg) lock
 ///  1. Sign transaction
 ///  2. Inspect transaction information
@@ -146,14 +161,18 @@ impl TxHelper {
         check_lock_script(&lock, skip_check)?;
 
         let since = if let Some(number) = since_absolute_epoch_opt {
+            dbg!(1);
             Since::new_absolute_epoch(number).value()
         } else {
+            dbg!(2);
             let lock_arg = lock.args().raw_data();
             if lock.code_hash() == MULTISIG_TYPE_HASH.pack() && lock_arg.len() == 28 {
+                dbg!(3);
                 let mut since_bytes = [0u8; 8];
                 since_bytes.copy_from_slice(&lock_arg[20..]);
                 u64::from_le_bytes(since_bytes)
             } else {
+                dbg!(4);
                 0
             }
         };
@@ -166,15 +185,19 @@ impl TxHelper {
         let outpoint_cell: CellOutput = get_live_cell(out_point, skip_check)?;
         let code_hash: H256 = outpoint_cell.lock().code_hash().unpack();
         let cell_dep = if code_hash == SIGHASH_TYPE_HASH {
+            dbg!(5);
             Some(genesis_info.sighash_dep())
         } else if code_hash == MULTISIG_TYPE_HASH {
+            dbg!(6);
             Some(genesis_info.multisig_dep())
         } else {
+            dbg!(7);
             None
         };
 
         let mut tx_builder = self.transaction.as_advanced_builder().input(input);
         if cell_dep.is_some() {
+            dbg!(8);
             let cell_dep = cell_dep.expect("invalid cell dep");
             if self
                 .transaction
@@ -182,6 +205,7 @@ impl TxHelper {
                 .into_iter()
                 .all(|d| d != cell_dep)
             {
+                dbg!(9);
                 tx_builder = tx_builder.cell_dep(cell_dep);
             }
         }

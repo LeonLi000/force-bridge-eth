@@ -1,17 +1,18 @@
-use crate::util::ckb_util::{parse_cell, parse_main_chain_headers, Generator};
+use crate::util::ckb_util::{parse_cell, parse_main_chain_headers, Generator, CONFIRM};
 use crate::util::eth_proof_helper::{read_block, Witness};
-use crate::util::eth_util::Web3Client;
+use crate::util::eth_util::{transfer_to_header, Web3Client};
 use crate::util::settings::Settings;
 use anyhow::{anyhow, Result};
+use ckb_jsonrpc_types::JsonBytes;
 use ckb_sdk::{AddressPayload, SECP256K1};
 use ckb_types::core::{DepType, TransactionView};
-use ckb_types::packed::{Byte32, Script};
-use ckb_types::prelude::{Builder, Entity};
+use ckb_types::packed::{Byte32, OutPoint, Script, Uint32};
+use ckb_types::prelude::{Builder, Entity, Unpack};
 use cmd_lib::run_cmd;
 use ethereum_types::H256;
 use force_sdk::cell_collector::get_live_cell_by_typescript;
 use force_sdk::indexer::{Cell, IndexerRpcClient};
-use force_sdk::tx_helper::sign;
+use force_sdk::tx_helper::{sign, sign_with_cache};
 use force_sdk::util::{parse_privkey_path, send_tx_sync};
 use log::{debug, info};
 use secp256k1::SecretKey;
@@ -68,10 +69,11 @@ impl ETHRelayer {
     // 5. If reorg does not occur, directly use header as tip to build output
     pub async fn start(&mut self) -> Result<()> {
         let typescript;
+        let mut cell_rest = Default::default();
         // The first relay will generate a unique typescript, and subsequent relays will always use this typescript.
         match &self.cell_typescript {
             None => {
-                let cell_script = self.do_first_relay().await?;
+                let (cell_script, _, cell_rest_) = self.do_first_relay().await?;
                 typescript = Script::new_builder()
                     .code_hash(cell_script.code_hash())
                     .hash_type(cell_script.hash_type())
@@ -84,6 +86,7 @@ impl ETHRelayer {
                     .write(&self.config_path)
                     .map_err(|e| anyhow!(e))?;
                 self.cell_typescript = Some(cell_script);
+                cell_rest = cell_rest_;
             }
             Some(cell_script) => {
                 typescript = Script::new_builder()
@@ -93,24 +96,24 @@ impl ETHRelayer {
                     .build();
             }
         }
-        println!(
-            "start cell typescript: \n{}",
-            serde_json::to_string_pretty(&ckb_jsonrpc_types::Script::from(typescript.clone()))
-                .map_err(|err| anyhow!(err))?
-        );
+        // println!(
+        //     "start cell typescript: \n{}",
+        //     serde_json::to_string_pretty(&ckb_jsonrpc_types::Script::from(typescript.clone()))
+        //         .map_err(|err| anyhow!(err))?
+        // );
         std::thread::sleep(std::time::Duration::from_secs(2));
         // get the latest output cell
         let cell = get_live_cell_by_typescript(&mut self.generator.indexer_client, typescript)
             .map_err(|err| anyhow::anyhow!(err))?
             .ok_or_else(|| anyhow::anyhow!("no cell found"))?;
 
-        self.do_relay_loop(cell).await?;
+        self.do_relay_loop(cell, cell_rest).await?;
         Ok(())
     }
 
     //The first time the relay uses the outpoint of the first input when it is created,
     // to ensure that the typescript is unique across the network
-    pub async fn do_first_relay(&mut self) -> Result<Script> {
+    pub async fn do_first_relay(&mut self) -> Result<(Script, Cell, Cell)> {
         let typescript = Script::new_builder()
             .code_hash(
                 Byte32::from_slice(
@@ -148,19 +151,52 @@ impl ETHRelayer {
             .map_err(|err| anyhow::anyhow!(err))?;
         send_tx_sync(&mut self.generator.rpc_client, &tx, 60)
             .map_err(|err| anyhow::anyhow!(err))?;
-
+        let cell_light_client = Cell {
+            output: ckb_jsonrpc_types::CellOutput::from(tx.output(0).unwrap()),
+            output_data: JsonBytes::from(tx.outputs_data().get_unchecked(0)),
+            out_point: ckb_jsonrpc_types::OutPoint {
+                tx_hash: tx.hash().unpack(),
+                index: ckb_jsonrpc_types::Uint32::from(0),
+            },
+            block_number: Default::default(),
+            tx_index: ckb_jsonrpc_types::Uint32::from(0),
+        };
+        let cell_rest = Cell {
+            output: ckb_jsonrpc_types::CellOutput::from(tx.output(1).unwrap()),
+            output_data: JsonBytes::from(tx.outputs_data().get_unchecked(1)),
+            out_point: ckb_jsonrpc_types::OutPoint {
+                tx_hash: tx.hash().unpack(),
+                index: ckb_jsonrpc_types::Uint32::from(1),
+            },
+            block_number: Default::default(),
+            tx_index: ckb_jsonrpc_types::Uint32::from(1),
+        };
+        for i in 0..tx.outputs().len() {
+            self.generator.live_cell_cache.insert(
+                (OutPoint::new(tx.hash(), i as u32), true),
+                (
+                    tx.outputs().get_unchecked(i),
+                    tx.outputs_data().get_unchecked(i).raw_data(),
+                ),
+            );
+            self.generator.live_cell_cache.insert(
+                (OutPoint::new(tx.hash(), i as u32), false),
+                (tx.outputs().get_unchecked(i), Default::default()),
+            );
+        }
         let cell_typescript = tx
             .output(0)
             .ok_or_else(|| anyhow!("no out_put found"))?
             .type_()
             .to_opt()
             .ok_or_else(|| anyhow!("cell_typescript is not found."))?;
-        println!(
-            "first relay cell typescript: \n{}",
-            serde_json::to_string_pretty(&ckb_jsonrpc_types::Script::from(cell_typescript.clone()))
-                .map_err(|err| anyhow!(err))?
-        );
-        Ok(cell_typescript)
+        // println!(
+        //     "first relay cell typescript: \n{}",
+        //     serde_json::to_string_pretty(&ckb_jsonrpc_types::Script::from(cell_typescript.clone()))
+        //         .map_err(|err| anyhow!(err))?
+        // );
+        dbg!(cell_rest.output.capacity.value());
+        Ok((cell_typescript, cell_light_client, cell_rest))
     }
 
     pub fn generate_witness(&mut self, number: u64) -> Result<Witness> {
@@ -173,10 +209,10 @@ impl ETHRelayer {
             header: block_with_proofs.header_rlp.0.clone(),
             merkle_proof: block_with_proofs.to_double_node_with_merkle_proof_vec(),
         };
-        debug!(
-            "generate witness for header_rlp. header_rlp: {:?}, witness: {:?}",
-            block_with_proofs.header_rlp.0, witness
-        );
+        // debug!(
+        //     "generate witness for header_rlp. header_rlp: {:?}, witness: {:?}",
+        //     block_with_proofs.header_rlp.0, witness
+        // );
         Ok(witness)
     }
 
@@ -213,9 +249,9 @@ impl ETHRelayer {
         anyhow::bail!("system error! can not find the common ancestor with main chain.")
     }
 
-    pub async fn do_relay_loop(&mut self, mut cell: Cell) -> Result<()> {
+    pub async fn do_relay_loop(&mut self, mut cell: Cell, mut rest_cell: Cell) -> Result<()> {
         let ckb_cell_data = cell.clone().output_data.as_bytes().to_vec();
-        let (un_confirmed_headers, _) = parse_main_chain_headers(ckb_cell_data)?;
+        let (mut un_confirmed_headers, _) = parse_main_chain_headers(ckb_cell_data)?;
         let index: isize = (un_confirmed_headers.len() - 1) as isize;
         // Determine whether the latest_header is on the Ethereum main chain
         // If it is in the main chain, the new header currently needs to be added current_height = latest_height + 1
@@ -227,63 +263,171 @@ impl ETHRelayer {
             .number
             .ok_or_else(|| anyhow!("the block number is not exist."))?;
         loop {
-            let new_number = number.add(1 as u64);
-            let new_header_temp = self.eth_client.get_block(new_number.into()).await;
-            if new_header_temp.is_err() {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                continue;
-            }
-            let new_header = new_header_temp.unwrap();
-            if new_header.parent_hash
-                == current_block
-                    .hash
-                    .ok_or_else(|| anyhow!("the block hash is not exist."))?
-            {
-                // No reorg
-                info!(
-                    "no reorg occurred, ready to relay new header: {:?}",
-                    new_header
-                );
-                let witness = self.generate_witness(new_number.as_u64())?;
-                let from_privkey = parse_privkey_path(self.priv_key_path.as_str())?;
-                let from_lockscript = self.generate_from_lockscript(from_privkey)?;
-                let unsigned_tx = self.generator.generate_eth_light_client_tx(
-                    &new_header,
-                    &cell,
-                    &witness,
-                    &un_confirmed_headers,
-                    from_lockscript,
-                )?;
-                let tx = sign(unsigned_tx, &mut self.generator.rpc_client, &from_privkey)
+            let mut tx_vec = vec![];
+            for i in 0..2 {
+                let new_number = number.add(1 as u64);
+                let new_header_temp = self.eth_client.get_block(new_number.into()).await;
+                if new_header_temp.is_err() {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
+                let new_header = new_header_temp.unwrap();
+                if new_header.parent_hash
+                    == current_block
+                        .hash
+                        .ok_or_else(|| anyhow!("the block hash is not exist."))?
+                {
+                    // No reorg
+                    info!(
+                        "no reorg occurred, ready to relay new header: {:?}",
+                        new_header
+                    );
+                    let witness = self.generate_witness(new_number.as_u64())?;
+                    let from_privkey = parse_privkey_path(self.priv_key_path.as_str())?;
+                    let from_lockscript = self.generate_from_lockscript(from_privkey)?;
+                    // dbg!(cell.clone().out_point);
+                    let (unsigned_tx, new_cell, new_rest_cell) =
+                        self.generator.generate_eth_light_client_tx(
+                            &new_header,
+                            cell.clone(),
+                            rest_cell.clone(),
+                            &witness,
+                            &un_confirmed_headers,
+                            from_lockscript,
+                        )?;
+                    let tx = sign_with_cache(
+                        &mut self.generator.live_cell_cache,
+                        unsigned_tx,
+                        &mut self.generator.rpc_client,
+                        &from_privkey,
+                    )
                     .map_err(|err| anyhow::anyhow!(err))?;
-                // send_tx_sync(&mut self.generator.rpc_client, &tx, 60)
-                //     .map_err(|err| anyhow::anyhow!(err))?;
-                self.generator
-                    .rpc_client
-                    .send_transaction(tx.data())
-                    .map_err(|err| anyhow!(err))?;
+                    // send_tx_sync(&mut self.generator.rpc_client, &tx, 60)
+                    //     .map_err(|err| anyhow::anyhow!(err))?;
 
-                // update cell current_block and number.
-                update_cell_sync(&mut self.generator.indexer_client, &tx, 60, &mut cell)
-                    .map_err(|err| anyhow::anyhow!(err))?;
-                number = new_number;
-                current_block = new_header;
-                info!("Successfully relayed the current header, ready to relay the next one. current_number: {:?}", number);
-            } else {
-                // Reorg occurred, need to go back
-                info!("reorg occurred, ready to go back");
-                let index: isize = (un_confirmed_headers.len() - 1) as isize;
-                current_block = self
-                    .lookup_common_ancestor(&un_confirmed_headers, index)
-                    .await?;
-                info!(
-                    "reorg occurred, found the common ancestor. {:?}",
-                    current_block
-                );
-                number = current_block
-                    .number
-                    .ok_or_else(|| anyhow!("the block number is not exist."))?;
+                    // self.generator
+                    //     .rpc_client
+                    //     .send_transaction(tx.data())
+                    //     .map_err(|err| anyhow!(err))?;
+                    tx_vec.push(tx);
+
+                    // update cell current_block and number.
+                    cell = new_cell;
+                    rest_cell = new_rest_cell;
+                    // update_cell_sync(&mut self.generator.indexer_client, &tx, 60, &mut cell)
+                    //     .map_err(|err| anyhow::anyhow!(err))?;
+                    number = new_number;
+                    current_block = new_header.clone();
+                    un_confirmed_headers.push(transfer_to_header(&new_header));
+                    if un_confirmed_headers.len() > CONFIRM {
+                        un_confirmed_headers.remove(0);
+                    }
+
+                    info!("Successfully relayed the current header, ready to relay the next one. current_number: {:?}", number);
+                } else {
+                    // Reorg occurred, need to go back
+                    info!("reorg occurred, ready to go back");
+                    let index: isize = (un_confirmed_headers.len() - 1) as isize;
+                    current_block = self
+                        .lookup_common_ancestor(&un_confirmed_headers, index)
+                        .await?;
+                    info!(
+                        "reorg occurred, found the common ancestor. {:?}",
+                        current_block
+                    );
+                    number = current_block
+                        .number
+                        .ok_or_else(|| anyhow!("the block number is not exist."))?;
+                }
             }
+            let mut txs_hash = vec![];
+            for item in tx_vec {
+                let tx_hash = self
+                    .generator
+                    .rpc_client
+                    .send_transaction(item.data())
+                    .map_err(|err| anyhow!(err))?;
+                txs_hash.push(tx_hash);
+            }
+            for j in 0..60 {
+                for item in &txs_hash {
+                    let status = self
+                        .generator
+                        .rpc_client
+                        .get_transaction(item.clone())
+                        .unwrap()
+                        .map(|t| t.tx_status.status);
+                    log::info!(
+                        "waiting for tx {} to be committed, loop index: {}, status: {:?}",
+                        &item,
+                        j,
+                        status
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+
+            // update_cell_sync(&mut self.generator.indexer_client, &tx, 60, &mut cell)
+            //     .map_err(|err| anyhow::anyhow!(err))?;
+
+            // let new_number = number.add(1 as u64);
+            // let new_header_temp = self.eth_client.get_block(new_number.into()).await;
+            // if new_header_temp.is_err() {
+            //     std::thread::sleep(std::time::Duration::from_secs(1));
+            //     continue;
+            // }
+            // let new_header = new_header_temp.unwrap();
+            // if new_header.parent_hash
+            //     == current_block
+            //         .hash
+            //         .ok_or_else(|| anyhow!("the block hash is not exist."))?
+            // {
+            //     // No reorg
+            //     info!(
+            //         "no reorg occurred, ready to relay new header: {:?}",
+            //         new_header
+            //     );
+            //     let witness = self.generate_witness(new_number.as_u64())?;
+            //     let from_privkey = parse_privkey_path(self.priv_key_path.as_str())?;
+            //     let from_lockscript = self.generate_from_lockscript(from_privkey)?;
+            //     let (unsigned_tx, new_cell) = self.generator.generate_eth_light_client_tx(
+            //         &new_header,
+            //         &cell,
+            //         &witness,
+            //         &un_confirmed_headers,
+            //         from_lockscript,
+            //     )?;
+            //     let tx = sign(unsigned_tx, &mut self.generator.rpc_client, &from_privkey)
+            //         .map_err(|err| anyhow::anyhow!(err))?;
+            //     // send_tx_sync(&mut self.generator.rpc_client, &tx, 60)
+            //     //     .map_err(|err| anyhow::anyhow!(err))?;
+            //
+            //     self.generator
+            //         .rpc_client
+            //         .send_transaction(tx.data())
+            //         .map_err(|err| anyhow!(err))?;
+            //
+            //     // update cell current_block and number.
+            //     update_cell_sync(&mut self.generator.indexer_client, &tx, 60, &mut cell)
+            //         .map_err(|err| anyhow::anyhow!(err))?;
+            //     number = new_number;
+            //     current_block = new_header;
+            //     info!("Successfully relayed the current header, ready to relay the next one. current_number: {:?}", number);
+            // } else {
+            //     // Reorg occurred, need to go back
+            //     info!("reorg occurred, ready to go back");
+            //     let index: isize = (un_confirmed_headers.len() - 1) as isize;
+            //     current_block = self
+            //         .lookup_common_ancestor(&un_confirmed_headers, index)
+            //         .await?;
+            //     info!(
+            //         "reorg occurred, found the common ancestor. {:?}",
+            //         current_block
+            //     );
+            //     number = current_block
+            //         .number
+            //         .ok_or_else(|| anyhow!("the block number is not exist."))?;
+            // }
 
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
