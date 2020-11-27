@@ -302,6 +302,13 @@ impl ETHRelayer {
                         &from_privkey,
                     )
                     .map_err(|err| anyhow::anyhow!(err))?;
+                    log::info!(
+                        "tx: \n{}",
+                        serde_json::to_string_pretty(&ckb_jsonrpc_types::TransactionView::from(
+                            tx.clone()
+                        ))
+                        .map_err(|err| anyhow!(err))?
+                    );
                     // send_tx_sync(&mut self.generator.rpc_client, &tx, 60)
                     //     .map_err(|err| anyhow::anyhow!(err))?;
 
@@ -348,21 +355,23 @@ impl ETHRelayer {
                     .send_transaction(item.data())
                     .map_err(|err| anyhow!(err))?;
                 txs_hash.push(tx_hash);
+                std::thread::sleep(std::time::Duration::from_secs(20));
             }
             for j in 0..60 {
-                for item in &txs_hash {
-                    let status = self
-                        .generator
-                        .rpc_client
-                        .get_transaction(item.clone())
-                        .unwrap()
-                        .map(|t| t.tx_status.status);
-                    log::info!(
-                        "waiting for tx {} to be committed, loop index: {}, status: {:?}",
-                        &item,
-                        j,
-                        status
-                    );
+                let status = self
+                    .generator
+                    .rpc_client
+                    .get_transaction(txs_hash[1].clone())
+                    .unwrap()
+                    .map(|t| t.tx_status.status);
+                log::info!(
+                    "waiting for tx {} to be committed, loop index: {}, status: {:?}",
+                    &txs_hash[1],
+                    j,
+                    status
+                );
+                if status == Some(ckb_jsonrpc_types::Status::Committed) {
+                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }

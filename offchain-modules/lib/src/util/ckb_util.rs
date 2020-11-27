@@ -4,7 +4,7 @@ use crate::util::eth_util::{convert_to_header_rlp, decode_block_header};
 use crate::util::settings::{OutpointConf, Settings};
 use anyhow::{anyhow, bail, Result};
 use ckb_jsonrpc_types::{JsonBytes, Uint32};
-use ckb_sdk::constants::MIN_SECP_CELL_CAPACITY;
+use ckb_sdk::constants::{MIN_SECP_CELL_CAPACITY, MULTISIG_TYPE_HASH, SIGHASH_TYPE_HASH};
 use ckb_sdk::{Address, AddressPayload, GenesisInfo, HttpRpcClient, SECP256K1};
 use ckb_types::core::{BlockView, Capacity, DepType, TransactionView};
 use ckb_types::packed::{CellInput, HeaderVec, ScriptReader, WitnessArgs};
@@ -190,9 +190,18 @@ impl Generator {
         let input = CellInput::new_builder()
             .previous_output(OutPoint::from(cell.clone().out_point))
             .build();
-        // let outpoint_cell: CellOutput = get_live_cell(out_point, skip_check)?;
-        let cell_dep = Some(self.genesis_info.sighash_dep());
 
+        let code_hash: H256 = cell.clone().output.lock.code_hash;
+        let cell_dep = if code_hash == SIGHASH_TYPE_HASH {
+            dbg!(5);
+            Some(self.genesis_info.sighash_dep())
+        } else if code_hash == MULTISIG_TYPE_HASH {
+            dbg!(6);
+            Some(self.genesis_info.multisig_dep())
+        } else {
+            dbg!(7);
+            None
+        };
         let mut tx_builder = helper.transaction.as_advanced_builder().input(input);
         if cell_dep.is_some() {
             let cell_dep = cell_dep.expect("invalid cell dep");
@@ -337,8 +346,33 @@ impl Generator {
             .previous_output(rest_cell.clone().out_point.into())
             .since((0 as u64).pack())
             .build();
-        let tx_builder = helper.transaction.as_advanced_builder().input(input_rest);
+        let code_hash: H256 = rest_cell.clone().output.lock.code_hash;
+        let cell_dep = if code_hash == SIGHASH_TYPE_HASH {
+            dbg!(5);
+            Some(self.genesis_info.sighash_dep())
+        } else if code_hash == MULTISIG_TYPE_HASH {
+            dbg!(6);
+            Some(self.genesis_info.multisig_dep())
+        } else {
+            dbg!(7);
+            None
+        };
+        let mut tx_builder = helper.transaction.as_advanced_builder().input(input_rest);
+        if cell_dep.is_some() {
+            dbg!(8);
+            let cell_dep = cell_dep.expect("invalid cell dep");
+            if helper
+                .transaction
+                .cell_deps()
+                .into_iter()
+                .all(|d| d != cell_dep)
+            {
+                dbg!(9);
+                tx_builder = tx_builder.cell_dep(cell_dep);
+            }
+        }
         helper.transaction = tx_builder.build();
+
         let output_cap: u64 = helper.transaction.output(0).unwrap().capacity().unpack();
         let input_cap = cell.clone().output.capacity.value();
         let rest_capacity = rest_cell.output.capacity.value() + input_cap - tx_fee - output_cap;
