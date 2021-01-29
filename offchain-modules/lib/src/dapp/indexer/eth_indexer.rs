@@ -27,6 +27,7 @@ use sqlx::MySqlPool;
 use web3::types::{Block, H256, U64};
 
 pub const ETH_CHAIN_CONFIRMED: usize = 15;
+pub const BLOCK_INTERVAL: u64 = 100;
 
 pub struct EthIndexer<T> {
     pub config_path: String,
@@ -137,7 +138,17 @@ impl<T: IndexerFilter> EthIndexer<T> {
             anyhow::bail!("system error! the unconfirmed_blocks is invalid.")
         }
         let mut re_org = false;
-
+        let latest_height = self.eth_client.client().eth().block_number().await?;
+        if latest_height.as_u64() - start_block_number > BLOCK_INTERVAL {
+            self.handle_event_batch(
+                lock_contract_address.clone(),
+                start_block_number,
+                latest_height.as_u64(),
+                &mut unconfirmed_blocks,
+                &mut tail,
+            )
+            .await?;
+        }
         loop {
             log::info!("handle block number: {:?}", start_block_number);
             let block = self
@@ -245,6 +256,62 @@ impl<T: IndexerFilter> EthIndexer<T> {
             index -= 1;
         }
         anyhow::bail!("system error! can not find the common ancestor with main chain.")
+    }
+
+    pub async fn handle_event_batch(
+        &mut self,
+        lock_contract_address: String,
+        start_number: &mut u64,
+        end_number: u64,
+        unconfirmed_blocks: &mut Vec<EthUnConfirmedBlock>,
+        tail: &mut EthUnConfirmedBlock,
+    ) -> Result<()> {
+        let mut block = self
+            .eth_client
+            .get_block(U64::from(*start_number).into())
+            .await?;
+        let left = hex::encode(block.parent_hash);
+        if left != tail.hash {
+            // the chain is re_organized.
+            log::info!("the chain is re_organized");
+            re_org = true;
+            block = self
+                .lookup_common_ancestor_in_eth(
+                    &unconfirmed_blocks,
+                    (unconfirmed_blocks.len() - 1) as isize,
+                )
+                .await?;
+            *start_number = block
+                .number
+                .ok_or_else(|| anyhow!("invalid block number"))?
+                .as_u64()
+                + 1;
+        }
+        let (lock_vec, unlock_vec) = self.parse_event_batch_with_retry(
+            *start_number,
+            end_number,
+            5,
+            lock_contract_address.clone(),
+        )?;
+        if !lock_vec.is_empty() {
+            for item in lock_vec {
+                self.handle_lock_event(
+                    &mut lock_records,
+                    lock_contract_address.clone(),
+                    &item,
+                    *start_block_number,
+                )
+                .await?;
+            }
+        }
+        if !unlock_vec.is_empty() {
+            for item in unlock_vec {
+                self.handle_unlock_event(item.tx_hash, &mut unlock_records)
+                    .await?;
+            }
+        }
+
+        Ok(())
     }
 
     // handle eth event. parse lock event && unlock event.
@@ -417,6 +484,38 @@ impl<T: IndexerFilter> EthIndexer<T> {
                 self.eth_client.url(),
                 contract_addr.clone().as_str(),
                 hash_with_0x.clone().as_str(),
+            );
+            match ret {
+                Ok(ret) => return Ok(ret),
+                Err(e) => {
+                    info!("parse event failed, retried {} times, err: {}", retry, e);
+                    if e.to_string().contains("the event is not exist") {
+                        info!("the event tx is not exist");
+                        return Ok(Default::default());
+                    }
+                }
+            }
+        }
+        Err(anyhow!(
+            "Failed to parse event for block hash:{}, after retry {} times",
+            hash.as_str(),
+            max_retry_times
+        ))
+    }
+
+    pub fn parse_event_batch_with_retry(
+        &mut self,
+        start_number: u64,
+        end_number: u64,
+        max_retry_times: i32,
+        contract_addr: String,
+    ) -> Result<(Vec<EthSpvProof>, Vec<UnlockEvent>)> {
+        for retry in 0..max_retry_times {
+            let ret = parse_event_with_interval(
+                self.eth_client.url(),
+                contract_addr.clone().as_str(),
+                start_number,
+                end_number,
             );
             match ret {
                 Ok(ret) => return Ok(ret),
